@@ -1,0 +1,9 @@
+[general]
+name=EGMS Time Series Concatenation
+description=Concatenate EGMS time series from two CSV periods with optional AOI clipping
+version=1.0
+qgisMinimumVersion=3.28
+author=European Environmental Agency (EEA)
+about=For support, please visit https://land.copernicus.eu/en/contact-service-helpdesk  
+category=Analysis
+icon=icon.png
