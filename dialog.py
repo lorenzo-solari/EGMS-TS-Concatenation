@@ -1,155 +1,85 @@
-from qgis.PyQt.QtWidgets import (
-    QDialog,
-    QVBoxLayout,
-    QHBoxLayout,
-    QGridLayout,
-    QLabel,
-    QPushButton,
-    QLineEdit,
-    QFileDialog,
-    QCheckBox,
-    QComboBox,
-    QGroupBox,
-    QSizePolicy,
-    QSpacerItem,
-    QMessageBox
-)
-from qgis.PyQt.QtCore import Qt
-from qgis.PyQt.QtGui import QFont
+import os
 
-from qgis.core import (
-    QgsProject,
-    QgsMapLayerType,
-    QgsTask,
-    QgsApplication,
-    QgsVectorLayer,
-    QgsMessageLog,
-    Qgis
-)
+# ---------------------------------------------------------------------------
+# Qt compatibility: QGIS 3 (PyQt5/Qt5) and QGIS 4 (PyQt6/Qt6)
+# ---------------------------------------------------------------------------
+try:
+    from qgis.PyQt.QtWidgets import (
+        QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
+        QPushButton, QLineEdit, QFileDialog, QCheckBox, QComboBox,
+        QGroupBox, QSizePolicy, QSpacerItem, QMessageBox, QProgressBar
+    )
+    from qgis.PyQt.QtCore import Qt, QObject, pyqtSignal
+    from qgis.PyQt.QtGui import QFont
+except ImportError:
+    from PyQt6.QtWidgets import (
+        QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
+        QPushButton, QLineEdit, QFileDialog, QCheckBox, QComboBox,
+        QGroupBox, QSizePolicy, QSpacerItem, QMessageBox, QProgressBar
+    )
+    from PyQt6.QtCore import Qt, QObject, pyqtSignal
+    from PyQt6.QtGui import QFont
 
-from .egms_processing import run_concat
+_SP = getattr(QSizePolicy, 'Policy', QSizePolicy)
 
-LOG_TAG = "EGMS Concatenation"
+from qgis.core import QgsProject, QgsVectorLayer
 
+# QgsMapLayerType removed in QGIS 4
+try:
+    from qgis.core import Qgis
+    VECTOR_LAYER_TYPE = Qgis.LayerType.Vector
+except AttributeError:
+    try:
+        from qgis.core import QgsMapLayerType
+        VECTOR_LAYER_TYPE = QgsMapLayerType.VectorLayer
+    except ImportError:
+        VECTOR_LAYER_TYPE = None
 
-# ======================================================================
-# BACKGROUND TASK
-# ======================================================================
-
-class EGMSConcatTask(QgsTask):
-    """Runs run_concat in a background thread via the QGIS task manager."""
-
-    def __init__(self, csv1, csv2, output, aoi_path, layer_name, iface):
-        super().__init__("EGMS TS Concatenation", QgsTask.CanCancel)
-        self.csv1       = csv1
-        self.csv2       = csv2
-        self.output     = output
-        self.aoi_path   = aoi_path
-        self.layer_name = layer_name
-        self.iface      = iface
-        self.error      = None
-
-    # ------------------------------------------------------------------
-
-    def run(self):
-        try:
-            # Pass iface=None so run_concat does NOT try to load the layer
-            # inside the worker thread (Qt widgets must be created on the
-            # main thread). We load the layer in finished() instead.
-            run_concat(
-                self.csv1,
-                self.csv2,
-                self.output,
-                clip_shapefile=self.aoi_path,
-                iface=None,
-                layer_name=self.layer_name
-            )
-            return True
-        except Exception as e:
-            self.error = str(e)
-            QgsMessageLog.logMessage(
-                f"Task failed: {e}", LOG_TAG, level=Qgis.Critical
-            )
-            return False
-
-    # ------------------------------------------------------------------
-
-    def finished(self, result):
-        if result:
-            # Load the output CSV into QGIS now that we are back on the
-            # main thread
-            crs = "EPSG:3035"
-            x_field = "easting"
-            y_field = "northing"
-            uri = (
-                f"file:///{self.output}"
-                f"?delimiter=,&xField={x_field}&yField={y_field}&crs={crs}"
-            )
-            layer = QgsVectorLayer(uri, self.layer_name, "delimitedtext")
-            if layer.isValid():
-                QgsProject.instance().addMapLayer(layer)
-                QgsMessageLog.logMessage(
-                    f"Layer '{self.layer_name}' loaded successfully.",
-                    LOG_TAG, level=Qgis.Success
-                )
-            else:
-                QgsMessageLog.logMessage(
-                    f"Output CSV written but layer failed to load: {self.output}",
-                    LOG_TAG, level=Qgis.Warning
-                )
-
-            if self.iface:
-                self.iface.messageBar().pushMessage(
-                    "EGMS Concatenation",
-                    f"Done — layer '{self.layer_name}' loaded.",
-                    level=Qgis.Success,
-                    duration=6
-                )
-        else:
-            if self.iface:
-                self.iface.messageBar().pushMessage(
-                    "EGMS Concatenation",
-                    f"Processing failed: {self.error}",
-                    level=Qgis.Critical,
-                    duration=0
-                )
-
-    # ------------------------------------------------------------------
-
-    def cancel(self):
-        QgsMessageLog.logMessage("Task cancelled by user.", LOG_TAG, level=Qgis.Warning)
-        super().cancel()
+from .egms_processing import run_concat, crs, x_field, y_field
 
 
-# ======================================================================
-# HELPER WIDGET
-# ======================================================================
+def _bold(widget):
+    f = widget.font()
+    try:
+        f.setBold(True)
+    except Exception:
+        f.setWeight(QFont.Weight.Bold)
+    widget.setFont(f)
 
+
+# ---------------------------------------------------------------------------
+# Signal bridge: lets the background thread safely talk to the Qt main thread
+# Qt signals are always delivered on the thread that owns the receiver object,
+# so emitting from a worker thread safely queues the call onto the GUI thread.
+# ---------------------------------------------------------------------------
+class _WorkerSignals(QObject):
+    progress  = pyqtSignal(int, str)   # (percent, message)
+    finished  = pyqtSignal(str)        # output_csv path
+    error     = pyqtSignal(str)        # error message
+
+
+# ===========================================================================
+# Reusable input widget
+# ===========================================================================
 class LayerOrFileWidget(QGroupBox):
-    def __init__(self, title, file_filter="CSV (*.csv)", parent=None):
+    def __init__(self, title, file_filter="CSV files (*.csv)", parent=None):
         super().__init__(title, parent)
         self.file_filter = file_filter
 
         outer = QVBoxLayout(self)
-        outer.setSpacing(6)
+        outer.setSpacing(5)
 
-        # ── Loaded-layers row ─────────────────────────────────────────
-        lbl_layers = QLabel("Choose input layer:")
-        bold = lbl_layers.font()
-        bold.setBold(True)
-        lbl_layers.setFont(bold)
+        lbl_layers = QLabel("Layer loaded in QGIS:")
+        _bold(lbl_layers)
         outer.addWidget(lbl_layers)
 
         self.combo = QComboBox()
         self.combo.setMinimumHeight(28)
-        self.combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.combo.setSizePolicy(_SP.Expanding, _SP.Fixed)
         outer.addWidget(self.combo)
 
-        # ── Browse row ────────────────────────────────────────────────
         lbl_file = QLabel("Or browse for a file:")
-        bold2 = lbl_file.font()
-        bold2.setBold(True)
-        lbl_file.setFont(bold2)
+        _bold(lbl_file)
         outer.addWidget(lbl_file)
 
         browse_row = QHBoxLayout()
@@ -163,41 +93,33 @@ class LayerOrFileWidget(QGroupBox):
         browse_row.addWidget(browse_btn)
         outer.addLayout(browse_row)
 
-        # ── Signals ───────────────────────────────────────────────────
         browse_btn.clicked.connect(self._browse)
         self.combo.currentIndexChanged.connect(self._on_combo_changed)
         self.line.textEdited.connect(self._on_line_edited)
 
-    # ------------------------------------------------------------------
-
-    def populate(self, layer_types=None):
-        """Fill the combo with layers currently loaded in QGIS."""
+    def populate(self, layer_type=None):
         self.combo.blockSignals(True)
         self.combo.clear()
         self.combo.addItem("-- select a loaded layer --", userData=None)
         for layer in QgsProject.instance().mapLayers().values():
-            if layer_types and layer.type() not in layer_types:
+            if layer_type is not None and layer.type() != layer_type:
                 continue
             self.combo.addItem(layer.name(), userData=layer.source())
         self.combo.blockSignals(False)
 
     def path(self):
-        """Return the currently selected file path."""
         return self.line.text().strip()
-
-    # ------------------------------------------------------------------
 
     def _browse(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select File", "", self.file_filter
-        )
+            self, "Select File", "", self.file_filter)
         if path:
             self.line.setText(path)
             self.combo.blockSignals(True)
             self.combo.setCurrentIndex(0)
             self.combo.blockSignals(False)
 
-    def _on_combo_changed(self, index):
+    def _on_combo_changed(self, _index):
         source = self.combo.currentData()
         if source:
             clean = source.split("?")[0]
@@ -211,57 +133,56 @@ class LayerOrFileWidget(QGroupBox):
         self.combo.blockSignals(False)
 
 
-# ======================================================================
+# ===========================================================================
 # MAIN DIALOG
-# ======================================================================
-
+# ===========================================================================
 class EGMSDialog(QDialog):
 
     def __init__(self, iface):
         super().__init__()
+        self.iface   = iface
+        self._thread = None
 
-        self.iface = iface
-        self._task  = None   
+        # Signal bridge – lives on the main thread, so all slots run here
+        self._signals = _WorkerSignals()
+        self._signals.progress.connect(self._on_progress)
+        self._signals.finished.connect(self._on_finished)
+        self._signals.error.connect(self._on_error)
+
         self.setWindowTitle("EGMS Time Series Concatenation")
-        self.setMinimumSize(700, 640)
-        self.resize(740, 700)
+        self.setMinimumSize(700, 620)
+        self.resize(740, 680)
 
         main_layout = QVBoxLayout(self)
         main_layout.setSpacing(14)
         main_layout.setContentsMargins(16, 16, 16, 16)
 
-        # ── Period 1 ──────────────────────────────────────────────────
-        self.w_csv1 = LayerOrFileWidget(
-            "EGMS input layer - Period 1 (csv)", file_filter="CSV files (*.csv)"
-        )
+        # -- Period 1 -----------------------------------------------------
+        self.w_csv1 = LayerOrFileWidget("Period 1 CSV",
+                                        file_filter="CSV files (*.csv)")
         main_layout.addWidget(self.w_csv1)
 
-        # ── Period 2 ──────────────────────────────────────────────────
-        self.w_csv2 = LayerOrFileWidget(
-            "EGMS input layer - Period 2 (csv)", file_filter="CSV files (*.csv)"
-        )
+        # -- Period 2 -----------------------------------------------------
+        self.w_csv2 = LayerOrFileWidget("Period 2 CSV",
+                                        file_filter="CSV files (*.csv)")
         main_layout.addWidget(self.w_csv2)
 
-        # ── AOI (optional) ────────────────────────────────────────────
+        # -- AOI (optional) -----------------------------------------------
         self.use_aoi = QCheckBox("Clip to AOI (optional)")
-        f = self.use_aoi.font()
-        f.setBold(True)
-        self.use_aoi.setFont(f)
+        _bold(self.use_aoi)
         main_layout.addWidget(self.use_aoi)
 
-        self.w_aoi = LayerOrFileWidget(
-            "AOI polygon shapefile", file_filter="Shapefile (*.shp)"
-        )
+        self.w_aoi = LayerOrFileWidget("AOI Shapefile",
+                                       file_filter="Shapefile (*.shp)")
         self.w_aoi.setEnabled(False)
         main_layout.addWidget(self.w_aoi)
         self.use_aoi.toggled.connect(self.w_aoi.setEnabled)
 
-        # ── Output ────────────────────────────────────────────────────
+        # -- Output -------------------------------------------------------
         out_group = QGroupBox("Output")
-        out_grid = QGridLayout(out_group)
+        out_grid  = QGridLayout(out_group)
         out_grid.setSpacing(8)
-
-        out_grid.addWidget(QLabel("Output csv file:"), 0, 0)
+        out_grid.addWidget(QLabel("Output CSV file:"), 0, 0)
         self.out_csv = QLineEdit()
         self.out_csv.setPlaceholderText("Path to output .csv ...")
         self.out_csv.setMinimumHeight(28)
@@ -271,96 +192,139 @@ class EGMSDialog(QDialog):
         btn_out.setMinimumHeight(28)
         btn_out.clicked.connect(self._select_output)
         out_grid.addWidget(btn_out, 0, 2)
-
         main_layout.addWidget(out_group)
 
-        # ── Spacer ────────────────────────────────────────────────────
-        main_layout.addSpacerItem(
-            QSpacerItem(20, 10, QSizePolicy.Minimum, QSizePolicy.Expanding)
-        )
+        # -- Progress bar -------------------------------------------------
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setVisible(False)
+        main_layout.addWidget(self.progress_bar)
 
-        # ── Button bar ────────────────────────────────────────────────
+        self.status_label = QLabel("")
+        self.status_label.setVisible(False)
+        main_layout.addWidget(self.status_label)
+
+        # -- Spacer -------------------------------------------------------
+        main_layout.addSpacerItem(
+            QSpacerItem(20, 10, _SP.Minimum, _SP.Expanding))
+
+        # -- Button bar ---------------------------------------------------
         btn_row = QHBoxLayout()
         btn_row.addSpacerItem(
-            QSpacerItem(40, 20, QSizePolicy.Expanding, QSizePolicy.Minimum)
-        )
+            QSpacerItem(40, 20, _SP.Expanding, _SP.Minimum))
 
         self.run_button = QPushButton("Run")
         self.run_button.setMinimumHeight(36)
         self.run_button.setMinimumWidth(120)
         self.run_button.setDefault(True)
-        rf = self.run_button.font()
-        rf.setBold(True)
-        self.run_button.setFont(rf)
+        _bold(self.run_button)
         self.run_button.clicked.connect(self.execute)
         btn_row.addWidget(self.run_button)
 
-        close_btn = QPushButton("Close")
-        close_btn.setMinimumHeight(36)
-        close_btn.setMinimumWidth(90)
-        close_btn.clicked.connect(self.reject)
-        btn_row.addWidget(close_btn)
+        self.close_button = QPushButton("Close")
+        self.close_button.setMinimumHeight(36)
+        self.close_button.setMinimumWidth(90)
+        self.close_button.clicked.connect(self.reject)
+        btn_row.addWidget(self.close_button)
 
         main_layout.addLayout(btn_row)
 
-        # Populate layer combos
         self._refresh_layers()
 
     # ------------------------------------------------------------------
-
     def _refresh_layers(self):
         for w in (self.w_csv1, self.w_csv2, self.w_aoi):
-            w.populate(layer_types=[QgsMapLayerType.VectorLayer])
+            w.populate(layer_type=VECTOR_LAYER_TYPE)
 
     def _select_output(self):
         path, _ = QFileDialog.getSaveFileName(
-            self, "Select Output CSV", "", "CSV files (*.csv)"
-        )
+            self, "Select Output CSV", "", "CSV files (*.csv)")
         if path:
             if not path.lower().endswith(".csv"):
                 path += ".csv"
             self.out_csv.setText(path)
 
     # ------------------------------------------------------------------
-
     def execute(self):
-        import os
-
-        csv1       = self.w_csv1.path()
-        csv2       = self.w_csv2.path()
-        output     = self.out_csv.text().strip()
-        layer_name = os.path.splitext(os.path.basename(output))[0] if output else "EGMS_Fused_TS"
+        csv1   = self.w_csv1.path()
+        csv2   = self.w_csv2.path()
+        output = self.out_csv.text().strip()
 
         if not csv1 or not csv2 or not output:
             QMessageBox.warning(
-                self,
-                "Missing inputs",
-                "Please provide Period 1 CSV, Period 2 CSV, and an output file path."
-            )
+                self, "Missing inputs",
+                "Please provide Period 1 CSV, Period 2 CSV, and an output file path.")
             return
 
-        aoi_path = self.w_aoi.path() if self.use_aoi.isChecked() else None
+        layer_name = os.path.splitext(os.path.basename(output))[0]
+        aoi_path   = self.w_aoi.path() if self.use_aoi.isChecked() else None
 
-        # Disable Run while the task is active so it cannot be submitted twice
+        self._layer_name = layer_name
+
+        # Show progress UI, disable buttons
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self.status_label.setText("Starting...")
+        self.status_label.setVisible(True)
         self.run_button.setEnabled(False)
-        self.run_button.setText("Running…")
+        self.close_button.setEnabled(False)
 
-        # Create and queue the background task
-        self._task = EGMSConcatTask(
-            csv1, csv2, output, aoi_path, layer_name, self.iface
+        # Callbacks emit Qt signals → safely received on the main thread
+        sig = self._signals
+        self._thread = run_concat(
+            csv1, csv2, output,
+            clip_shapefile=aoi_path,
+            iface=self.iface,
+            layer_name=layer_name,
+            on_progress=lambda pct, msg: sig.progress.emit(pct, msg),
+            on_done=lambda path: sig.finished.emit(path),
+            on_error=lambda exc: sig.error.emit(str(exc)),
         )
 
-        # Re-enable the Run button once the task finishes (success or failure)
-        self._task.taskCompleted.connect(self._on_task_finished)
-        self._task.taskTerminated.connect(self._on_task_finished)
+    # ------------------------------------------------------------------
+    # Slots – always called on the main thread via Qt signal delivery
+    # ------------------------------------------------------------------
+    def _on_progress(self, pct, msg):
+        self.progress_bar.setValue(pct)
+        self.status_label.setText(msg)
 
-        QgsApplication.taskManager().addTask(self._task)
+    def _on_finished(self, output_csv):
+        # Build a robust URI that works on both QGIS 3 and QGIS 4.
+        # detectTypes=yes is required in QGIS 4 to prevent all fields
+        # being read as strings (which causes numeric attributes to appear empty).
+        # Path.as_uri() produces the correct file:/// prefix on all platforms.
+        from pathlib import Path
+        file_url = Path(output_csv).as_uri()
+        uri = (
+            f"{file_url}"
+            f"?delimiter=,"
+            f"&xField={x_field}"
+            f"&yField={y_field}"
+            f"&crs={crs}"
+            f"&detectTypes=yes"
+            f"&geomType=point"
+            f"&trimFields=yes"
+            f"&skipEmptyFields=no"
+        )
+        layer = QgsVectorLayer(uri, self._layer_name, "delimitedtext")
+        if layer.isValid():
+            QgsProject.instance().addMapLayer(layer)
 
-        # Close the dialog immediately — processing continues in background
+        self._reset_ui()
+        QMessageBox.information(
+            self, "Done",
+            f"Processing complete.\n"
+            f"Layer '{self._layer_name}' has been loaded in QGIS.")
         self.accept()
 
-    # ------------------------------------------------------------------
+    def _on_error(self, msg):
+        self._reset_ui()
+        QMessageBox.critical(self, "Error", msg)
 
-    def _on_task_finished(self):
+    def _reset_ui(self):
         self.run_button.setEnabled(True)
-        self.run_button.setText("Run")
+        self.close_button.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.status_label.setVisible(False)
