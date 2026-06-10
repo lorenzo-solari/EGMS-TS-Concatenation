@@ -3,7 +3,14 @@ name=EGMS Time Series Concatenation
 description=Concatenate EGMS time series from two CSV periods with optional AOI clipping
 version=1.0
 qgisMinimumVersion=3.28
+qgisMaximumVersion=4.99
 author=European Environmental Agency (EEA)
-about=For support, please visit https://land.copernicus.eu/en/contact-service-helpdesk  
+email=copernicus@eea.europa.eu
+homepage=https://land.copernicus.eu
+tracker=https://land.copernicus.eu/en/contact-service-helpdesk  
+repository=https://github.com/copernicus-land/EGMS-TS-Concatenation
 category=Analysis
 icon=icon.png
+license=EUPL 1.2 or later
+about=The EGMS Time Series Concatenation plugin for QGIS merges two consecutive European Ground Motion Service (EGMS) displacement time-series periods into a single, continuous dataset. It is designed for analysts working with the Copernicus EGMS product who need to extend their analysis beyond a single update period.
+The plugin requires Python packages: pandas, geopandas, numpy. If something fails, see the User manual https://github.com/copernicus-land/EGMS-TS-Concatenation
